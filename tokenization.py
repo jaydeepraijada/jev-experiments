@@ -63,3 +63,81 @@ def generate_position_ids(span):
         position_ids.append(answer_start_idx + idx)
 
     return position_ids
+
+def get_attention_mask(span):
+    L = span["answer_end_idx"] + 1
+    attention_mask = torch.zeros((L, L))
+
+    question_len = span["question_end_idx"] + 1
+
+    # Question tokens look back at everything in the past (within the question)
+    attention_mask[:question_len, :question_len] = torch.tril(torch.ones(question_len, question_len))
+
+    # Data structure that stores the spans of the choices (begin, end of each choices)
+    choice_spans = []
+    choice_start_idx = question_len
+    for choice_end_idx in span["choices_end_idx"]:
+        choice_spans.append((choice_start_idx, choice_end_idx))
+        choice_start_idx = choice_end_idx + 1
+
+
+    # Looped over each span of the choices and set the attention mask for the span
+    for choice_start_idx, choice_end_idx in choice_spans:
+
+
+        # Each choice tokens looks back within that choice span (using causal mask)
+        attention_mask[
+            choice_start_idx:choice_end_idx + 1,
+            choice_start_idx:choice_end_idx + 1
+        ] = torch.tril(torch.ones(choice_end_idx - choice_start_idx + 1,
+                                choice_end_idx - choice_start_idx + 1)
+                        )
+
+    # Choice tokens look at question tokens
+    attention_mask[question_len:, :question_len] = 1
+
+    # Answer tokens looks back at everything in the past
+    answer_tokens_begin = choice_spans[-1][1] + 1
+    attention_mask[answer_tokens_begin:, :answer_tokens_begin] = 1
+    attention_mask[answer_tokens_begin:, answer_tokens_begin:] = torch.tril(torch.ones(L - answer_tokens_begin, L - answer_tokens_begin))
+    return attention_mask
+
+def truncate(text, max_tokens):
+    tokens = tokenizer.encode(text)
+    if len(tokens) <= max_tokens:
+        return text
+    return tokenizer.decode(tokens[:max_tokens])
+
+
+# Short natural-language task hint
+TASK_PROMPTS = {
+    "choice": "Choose the best option.",
+    "score": "Rate it on the given scale.",
+    "noul": "Answer yes or no.",
+}
+
+
+def build_question(state, instructions, task_type, max_state_tokens):
+    # Task hint and question come before the state, so every state token is read knowing what is asked
+    return f"{TASK_PROMPTS[task_type]}\nQuestion: {instructions}\n\n{truncate(state, max_state_tokens)}\n"
+
+
+def encode_example(state, instructions, choices, task_type, max_state_tokens, max_choice_tokens):
+    question = build_question(state, instructions, task_type, max_state_tokens)
+    choices = [truncate(choice, max_choice_tokens) for choice in choices]
+
+    final_tokens, span = tokenize_prompt(question, choices)
+    position_ids = generate_position_ids(span)
+    attention_mask = get_attention_mask(span)
+
+    # Choice embeddings are read at the last content token of each choice, not at the closing ">" of </option>
+    choice_end_token_len = len(tokenizer.encode("</option>"))
+    choice_read_idx = [end_idx - choice_end_token_len for end_idx in span["choices_end_idx"]]
+
+    return {
+        "input_ids": final_tokens,
+        "position_ids": position_ids,
+        "attention_mask": attention_mask,
+        "choice_read_idx": choice_read_idx,
+        "answer_end_idx": span["answer_end_idx"],
+    }
